@@ -1,0 +1,7 @@
+# ForumLLM - Dependencies
+# A nostalgic Ollama client with proper padding
+
+PyQt6>=6.4.0    
+Pygments>=2.15.0
+matplotlib>=3.7.0
+markdown>=3.4.0
