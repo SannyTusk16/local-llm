@@ -6,10 +6,13 @@ All traffic stays on your machine - nothing leaves your computer.
 
 import json
 import threading
+import base64
+import mimetypes
 import urllib.request
 import urllib.error
 from typing import Callable, Optional, List, Dict
 from dataclasses import dataclass
+from pathlib import Path
 
 
 OLLAMA_BASE_URL = "http://localhost:11434"
@@ -37,8 +40,17 @@ class OllamaRunner:
         self._running = False
         self._system_message: Optional[str] = None
         self._options: dict = {}
-        self._messages: List[Dict[str, str]] = []
+        self._messages: List[Dict[str, object]] = []
         self._cancel_flag = False
+        self._model_capabilities: set[str] = set()
+
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+    DOC_TEXT_EXTENSIONS = {
+        ".txt", ".md", ".rst", ".json", ".yaml", ".yml", ".csv",
+        ".tsv", ".py", ".js", ".ts", ".html", ".css", ".xml", ".ini", ".log"
+    }
+    DOC_BINARY_EXTENSIONS = {".pdf", ".doc", ".docx"}
+    AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac"}
     
     @staticmethod
     def is_ollama_installed() -> bool:
@@ -74,6 +86,24 @@ class OllamaRunner:
         except Exception as e:
             print(f"Error listing models: {e}")
             return []
+
+    @staticmethod
+    def get_model_capabilities(model: str) -> set[str]:
+        """Query Ollama for model capabilities (if available)."""
+        try:
+            req = urllib.request.Request(
+                f"{OLLAMA_BASE_URL}/api/show",
+                data=json.dumps({"name": model}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode("utf-8"))
+
+            caps = data.get("capabilities", []) or []
+            return {str(cap).lower() for cap in caps}
+        except Exception:
+            return set()
     
     def set_options(self, **options) -> None:
         """Set generation options (temperature, top_p, etc.)."""
@@ -90,16 +120,122 @@ class OllamaRunner:
         self._running = True
         self._cancel_flag = False
         self._messages = []
+        self._model_capabilities = self.get_model_capabilities(model)
         if self._system_message:
             self._messages.append({"role": "system", "content": self._system_message})
         return self.is_ollama_installed()
+
+    def _encode_file_b64(self, file_path: Path) -> str:
+        """Read and base64-encode a file."""
+        with open(file_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+
+    def _extract_document_text(self, file_path: Path) -> str:
+        """Extract text from common document types."""
+        suffix = file_path.suffix.lower()
+
+        if suffix in self.DOC_TEXT_EXTENSIONS:
+            return file_path.read_text(encoding="utf-8", errors="ignore")
+
+        if suffix == ".pdf":
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(str(file_path))
+                pages = []
+                for page in reader.pages:
+                    pages.append(page.extract_text() or "")
+                return "\n".join(pages)
+            except Exception as e:
+                raise ValueError(f"Could not parse PDF '{file_path.name}': {e}")
+
+        if suffix in {".doc", ".docx"}:
+            try:
+                import docx
+                document = docx.Document(str(file_path))
+                return "\n".join(p.text for p in document.paragraphs)
+            except Exception as e:
+                raise ValueError(f"Could not parse Word document '{file_path.name}': {e}")
+
+        raise ValueError(f"Unsupported document format: {file_path.suffix}")
+
+    def _build_user_message(
+        self,
+        message: str,
+        attachments: Optional[List[str]] = None
+    ) -> Dict[str, object]:
+        """
+        Build a user message payload from text + attachments.
+
+        Images are sent via Ollama's native `images` payload.
+        Documents are parsed into text and appended to the message.
+        Audio is sent as base64 under `audios` for audio-capable models.
+        """
+        user_message: Dict[str, object] = {"role": "user", "content": message}
+
+        if not attachments:
+            return user_message
+
+        images_b64: List[str] = []
+        audios_payload: List[Dict[str, str]] = []
+        doc_context_parts: List[str] = []
+
+        for raw_path in attachments:
+            file_path = Path(raw_path)
+
+            if not file_path.exists() or not file_path.is_file():
+                raise ValueError(f"Attachment not found: {raw_path}")
+
+            suffix = file_path.suffix.lower()
+            mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+
+            if suffix in self.IMAGE_EXTENSIONS:
+                if "vision" not in self._model_capabilities and self._model_capabilities:
+                    raise ValueError(f"Model '{self._model}' does not advertise image input support")
+                images_b64.append(self._encode_file_b64(file_path))
+                continue
+
+            if suffix in self.AUDIO_EXTENSIONS:
+                if "audio" not in self._model_capabilities:
+                    raise ValueError(
+                        f"Model '{self._model}' does not advertise audio input support"
+                    )
+                audios_payload.append(
+                    {
+                        "filename": file_path.name,
+                        "mime_type": mime_type,
+                        "data": self._encode_file_b64(file_path),
+                    }
+                )
+                continue
+
+            if suffix in self.DOC_TEXT_EXTENSIONS or suffix in self.DOC_BINARY_EXTENSIONS:
+                extracted = self._extract_document_text(file_path)
+                if extracted.strip():
+                    doc_context_parts.append(
+                        f"\n\n--- Document: {file_path.name} ---\n{extracted}"
+                    )
+                continue
+
+            raise ValueError(f"Unsupported attachment type: {file_path.name}")
+
+        if images_b64:
+            user_message["images"] = images_b64
+
+        if audios_payload:
+            user_message["audios"] = audios_payload
+
+        if doc_context_parts:
+            user_message["content"] = f"{message}{''.join(doc_context_parts)}"
+
+        return user_message
     
     def send_message(
         self,
         message: str,
         on_token: Callable[[str], None],
         on_complete: Callable[[], None],
-        on_error: Callable[[str], None]
+        on_error: Callable[[str], None],
+        attachments: Optional[List[str]] = None
     ) -> None:
         """Send a message and stream the response."""
         print(f"[DEBUG] send_message called, running={self._running}, model={self._model}")
@@ -109,7 +245,13 @@ class OllamaRunner:
             return
         
         self._cancel_flag = False
-        self._messages.append({"role": "user", "content": message})
+        try:
+            user_message = self._build_user_message(message, attachments)
+        except ValueError as e:
+            on_error(str(e))
+            return
+
+        self._messages.append(user_message)
         print(f"[DEBUG] Starting stream thread for: {message[:50]}...")
         
         def stream_response():
@@ -195,6 +337,7 @@ class OllamaRunner:
         self._cancel_flag = True
         self._running = False
         self._messages = []
+        self._model_capabilities = set()
     
     def cancel_generation(self) -> None:
         """Cancel current generation without stopping session."""
@@ -210,7 +353,7 @@ class OllamaRunner:
         """Get the current model name."""
         return self._model if self._running else None
     
-    def get_conversation_history(self) -> List[Dict[str, str]]:
+    def get_conversation_history(self) -> List[Dict[str, object]]:
         """Get the current conversation history."""
         return self._messages.copy()
     

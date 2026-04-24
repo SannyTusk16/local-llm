@@ -363,8 +363,8 @@ class ForumLLMApp(QMainWindow):
             if self.ollama.is_running:
                 self.ollama.stop()
     
-    @pyqtSlot(str)
-    def _on_message_sent(self, message: str) -> None:
+    @pyqtSlot(str, list)
+    def _on_message_sent(self, message: str, attachments: list) -> None:
         """Handle sending a message."""
         if not self._current_conversation:
             # Start a new chat first
@@ -387,18 +387,28 @@ class ForumLLMApp(QMainWindow):
         self._is_generating = True
         self.input_area.set_enabled(False)
         self.status_label.setText("Generating...")
+
+        # Show attachment names in transcript for traceability.
+        message_for_display = message
+        if attachments:
+            attachment_lines = "\n".join(f"- {Path(p).name}" for p in attachments)
+            if message_for_display.strip():
+                message_for_display = f"{message_for_display}\n\nAttachments:\n{attachment_lines}"
+            else:
+                message_for_display = f"Attachments:\n{attachment_lines}"
         
         # Add user message to display and database
-        self.chat_panel.add_message('user', message)
+        self.chat_panel.add_message('user', message_for_display)
         self.chat_history.add_message(
             self._current_conversation.id,
             'user',
-            message
+            message_for_display
         )
         
         # Update conversation title if it's the first message
         if len(self.chat_panel.get_messages()) == 1:
-            title = message[:50] + ("..." if len(message) > 50 else "")
+            title_source = message_for_display.strip() or "New Chat"
+            title = title_source[:50] + ("..." if len(title_source) > 50 else "")
             self.chat_history.update_conversation_title(
                 self._current_conversation.id,
                 title
@@ -425,7 +435,13 @@ class ForumLLMApp(QMainWindow):
             # Use signal for thread-safe callback to main thread
             self._generation_error.emit(error)
         
-        self.ollama.send_message(message, on_token, on_complete, on_error)
+        self.ollama.send_message(
+            message,
+            on_token,
+            on_complete,
+            on_error,
+            attachments=attachments
+        )
     
     @pyqtSlot()
     def _handle_generation_complete(self) -> None:
