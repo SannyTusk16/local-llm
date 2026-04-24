@@ -12,6 +12,9 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QMetaObject, Q_ARG
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 
 from pathlib import Path
+import shutil
+import base64
+from uuid import uuid4
 from typing import Optional
 
 from .widgets.sidebar import Sidebar
@@ -20,6 +23,7 @@ from .widgets.input_area import InputArea
 from .widgets.settings_dialog import SettingsDialog
 from .core.config import Config
 from .core.ollama_runner import OllamaRunner
+from .core.openclaw_wrapper import OpenClawWrapper
 from .core.chat_history import ChatHistory, Conversation
 
 
@@ -31,6 +35,9 @@ class ForumLLMApp(QMainWindow):
     # Signals for thread-safe callbacks
     _generation_complete = pyqtSignal()
     _generation_error = pyqtSignal(str)
+
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+    VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
     
     def __init__(self):
         super().__init__()
@@ -39,6 +46,8 @@ class ForumLLMApp(QMainWindow):
         self.config = Config()
         self.chat_history = ChatHistory(self.config.get_data_dir() / "chat_history.db")
         self.ollama = OllamaRunner()
+        self.openclaw = OpenClawWrapper()
+        self._apply_openclaw_settings()
         
         # State
         self._current_conversation: Optional[Conversation] = None
@@ -315,6 +324,7 @@ class ForumLLMApp(QMainWindow):
             self.ollama.stop()
         
         self._current_conversation = conversation
+        attachment_map = self.chat_history.get_conversation_attachments(conv_id)
         
         # Load messages into chat panel
         self.chat_panel.load_conversation(conversation.messages)
@@ -344,7 +354,13 @@ class ForumLLMApp(QMainWindow):
         
         # Restore conversation context to Ollama so it remembers previous messages
         for msg in conversation.messages:
-            self.ollama._messages.append({"role": msg.role, "content": msg.content})
+            self.ollama._messages.append(
+                self._build_runner_message_from_history(
+                    msg.role,
+                    msg.content,
+                    attachment_map.get(msg.id or -1, [])
+                )
+            )
         
         self.input_area.set_enabled(True)
         self.input_area.focus_input()
@@ -355,6 +371,8 @@ class ForumLLMApp(QMainWindow):
     @pyqtSlot(int)
     def _on_conversation_deleted(self, conv_id: int) -> None:
         """Handle conversation deletion."""
+        self._delete_conversation_attachments(conv_id)
+
         if self._current_conversation and self._current_conversation.id == conv_id:
             self._current_conversation = None
             self.chat_panel.clear()
@@ -362,6 +380,12 @@ class ForumLLMApp(QMainWindow):
             
             if self.ollama.is_running:
                 self.ollama.stop()
+
+    def _delete_conversation_attachments(self, conversation_id: int) -> None:
+        """Remove persisted attachments for a deleted conversation."""
+        attachment_dir = self.config.get_data_dir() / "attachments" / str(conversation_id)
+        if attachment_dir.exists() and attachment_dir.is_dir():
+            shutil.rmtree(attachment_dir, ignore_errors=True)
     
     @pyqtSlot(str, list)
     def _on_message_sent(self, message: str, attachments: list) -> None:
@@ -388,22 +412,39 @@ class ForumLLMApp(QMainWindow):
         self.input_area.set_enabled(False)
         self.status_label.setText("Generating...")
 
-        # Show attachment names in transcript for traceability.
+        persisted_attachments = self._persist_attachments(
+            self._current_conversation.id,
+            attachments
+        ) if attachments else []
+
+        # Show attachment names and previews in transcript for traceability.
         message_for_display = message
-        if attachments:
-            attachment_lines = "\n".join(f"- {Path(p).name}" for p in attachments)
+        if persisted_attachments:
+            attachment_lines = "\n".join(
+                f"- {Path(p).name}" for p in persisted_attachments
+            )
+            attachment_preview = self._build_attachment_preview_html(persisted_attachments)
             if message_for_display.strip():
-                message_for_display = f"{message_for_display}\n\nAttachments:\n{attachment_lines}"
+                message_for_display = (
+                    f"{message_for_display}\n\nAttachments:\n{attachment_lines}{attachment_preview}"
+                )
             else:
-                message_for_display = f"Attachments:\n{attachment_lines}"
+                message_for_display = f"Attachments:\n{attachment_lines}{attachment_preview}"
         
         # Add user message to display and database
         self.chat_panel.add_message('user', message_for_display)
-        self.chat_history.add_message(
+        stored_user_message = self.chat_history.add_message(
             self._current_conversation.id,
             'user',
             message_for_display
         )
+
+        if stored_user_message.id and persisted_attachments:
+            self.chat_history.add_attachments(
+                stored_user_message.id,
+                self._current_conversation.id,
+                persisted_attachments,
+            )
         
         # Update conversation title if it's the first message
         if len(self.chat_panel.get_messages()) == 1:
@@ -434,14 +475,116 @@ class ForumLLMApp(QMainWindow):
         def on_error(error: str) -> None:
             # Use signal for thread-safe callback to main thread
             self._generation_error.emit(error)
-        
+
+        # Route tool-heavy prompts to OpenClaw as a lightweight wrapper.
+        if self.openclaw.should_handle_prompt(message):
+            self.status_label.setText("OpenClaw...")
+            self.openclaw.send_message(
+                message,
+                on_token,
+                on_complete,
+                on_error,
+                attachments=persisted_attachments,
+            )
+            return
+
         self.ollama.send_message(
             message,
             on_token,
             on_complete,
             on_error,
-            attachments=attachments
+            attachments=persisted_attachments
         )
+
+    def _persist_attachments(self, conversation_id: int, attachments: list[str]) -> list[str]:
+        """Copy attachments into app data dir so previews survive app restarts."""
+        base_dir = self.config.get_data_dir() / "attachments" / str(conversation_id)
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        persisted: list[str] = []
+
+        for raw in attachments:
+            src = Path(raw)
+            if not src.exists() or not src.is_file():
+                continue
+
+            safe_suffix = src.suffix.lower()
+            unique_name = f"{src.stem}_{uuid4().hex[:8]}{safe_suffix}"
+            dst = base_dir / unique_name
+
+            try:
+                shutil.copy2(src, dst)
+                persisted.append(str(dst))
+            except Exception:
+                # Fallback to original path if copy fails.
+                persisted.append(str(src))
+
+        return persisted
+
+    def _build_runner_message_from_history(self, role: str, content: str, attachments: list) -> dict:
+        """Build runner message from saved history, including image payloads."""
+        message = {"role": role, "content": content}
+
+        if role != 'user' or not attachments:
+            return message
+
+        images_b64 = []
+        for attachment in attachments:
+            if attachment.kind != 'image':
+                continue
+
+            path = Path(attachment.file_path)
+            if not path.exists() or not path.is_file():
+                continue
+
+            try:
+                with open(path, 'rb') as f:
+                    images_b64.append(base64.b64encode(f.read()).decode('utf-8'))
+            except Exception:
+                continue
+
+        if images_b64:
+            message["images"] = images_b64
+
+        return message
+
+    def _build_attachment_preview_html(self, attachments: list[str]) -> str:
+        """Build lightweight preview HTML for image/video attachments."""
+        preview_blocks = []
+
+        for raw_path in attachments:
+            path = Path(raw_path)
+            suffix = path.suffix.lower()
+
+            try:
+                file_uri = path.resolve().as_uri()
+            except Exception:
+                continue
+
+            if suffix in self.IMAGE_EXTENSIONS:
+                preview_blocks.append(
+                    (
+                        "<div style='margin-top:8px;'>"
+                        f"<div><b>Image:</b> {path.name}</div>"
+                        f"<img src='{file_uri}' alt='{path.name}' style='max-width: 360px; max-height: 260px; border:1px solid #CCCCCC; border-radius:4px; margin-top:4px;' />"
+                        "</div>"
+                    )
+                )
+            elif suffix in self.VIDEO_EXTENSIONS:
+                preview_blocks.append(
+                    (
+                        "<div style='margin-top:8px;'>"
+                        f"<div><b>Video:</b> {path.name}</div>"
+                        f"<video src='{file_uri}' controls style='max-width: 360px; max-height: 260px; margin-top:4px;'></video>"
+                        f"<div><a href='{file_uri}'>Open video file</a></div>"
+                        "</div>"
+                    )
+                )
+
+        if not preview_blocks:
+            return ""
+
+        return "\n\n" + "\n".join(preview_blocks)
     
     @pyqtSlot()
     def _handle_generation_complete(self) -> None:
@@ -485,6 +628,8 @@ class ForumLLMApp(QMainWindow):
     @pyqtSlot()
     def _on_settings_changed(self) -> None:
         """Handle settings change."""
+        self._apply_openclaw_settings()
+
         # Update Ollama options if running
         if self.ollama.is_running:
             self.ollama.set_options(
@@ -494,6 +639,14 @@ class ForumLLMApp(QMainWindow):
                 repeat_penalty=self.config.llm.repeat_penalty,
                 context_length=self.config.llm.context_length
             )
+
+    def _apply_openclaw_settings(self) -> None:
+        """Apply persisted OpenClaw targeting settings to the wrapper."""
+        self.openclaw.set_targets(
+            agent_name=self.config.openclaw.agent_name,
+            session_id=self.config.openclaw.session_id,
+            to_target=self.config.openclaw.to_target,
+        )
     
     def _toggle_sidebar(self, checked: bool) -> None:
         """Toggle sidebar visibility."""

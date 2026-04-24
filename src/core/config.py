@@ -34,11 +34,20 @@ class UISettings:
 
 
 @dataclass
+class OpenClawSettings:
+    """OpenClaw CLI targeting settings."""
+    agent_name: str = ""
+    session_id: str = ""
+    to_target: str = ""
+
+
+@dataclass
 class AppConfig:
     """Main application configuration."""
     last_model: str = ""
     llm: LLMSettings = field(default_factory=LLMSettings)
     ui: UISettings = field(default_factory=UISettings)
+    openclaw: OpenClawSettings = field(default_factory=OpenClawSettings)
     
     # System message presets for quick access
     system_presets: dict = field(default_factory=lambda: {
@@ -90,6 +99,7 @@ class Config:
             'last_model': config.last_model,
             'llm': asdict(config.llm),
             'ui': asdict(config.ui),
+            'openclaw': asdict(config.openclaw),
             'system_presets': config.system_presets
         }
     
@@ -99,6 +109,7 @@ class Config:
             last_model=data.get('last_model', ''),
             llm=LLMSettings(**data.get('llm', {})),
             ui=UISettings(**data.get('ui', {})),
+            openclaw=OpenClawSettings(**data.get('openclaw', {})),
             system_presets=data.get('system_presets', AppConfig().system_presets)
         )
     
@@ -116,6 +127,11 @@ class Config:
     def last_model(self) -> str:
         """Get last used model."""
         return self._config.last_model
+
+    @property
+    def openclaw(self) -> OpenClawSettings:
+        """Get OpenClaw settings."""
+        return self._config.openclaw
     
     @last_model.setter
     def last_model(self, value: str) -> None:
@@ -147,6 +163,12 @@ class Config:
         for key, value in kwargs.items():
             if hasattr(self._config.ui, key):
                 setattr(self._config.ui, key, value)
+
+    def update_openclaw_settings(self, **kwargs) -> None:
+        """Update OpenClaw settings."""
+        for key, value in kwargs.items():
+            if hasattr(self._config.openclaw, key):
+                setattr(self._config.openclaw, key, value)
     
     def get_data_dir(self) -> Path:
         """Get the data directory path."""

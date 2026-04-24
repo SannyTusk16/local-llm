@@ -6,7 +6,7 @@ LLM fine-tuning options and application settings.
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QSlider, QSpinBox, QDoubleSpinBox, QComboBox,
-    QTextEdit, QPushButton, QGroupBox, QTabWidget,
+    QTextEdit, QPushButton, QGroupBox, QTabWidget, QLineEdit,
     QWidget, QFrame, QSizePolicy, QMessageBox
 )
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -195,6 +195,42 @@ class SettingsDialog(QDialog):
         system_layout.addLayout(save_preset_layout)
         
         self.tabs.addTab(system_tab, "System Message")
+
+        # === OpenClaw Tab ===
+        openclaw_tab = QWidget()
+        openclaw_layout = QVBoxLayout(openclaw_tab)
+        openclaw_layout.setContentsMargins(12, 12, 12, 12)
+        openclaw_layout.setSpacing(12)
+
+        target_group = QGroupBox("OpenClaw Target Selection")
+        target_layout = QGridLayout(target_group)
+
+        target_layout.addWidget(QLabel("Agent name (OPENCLAW_AGENT):"), 0, 0)
+        self.openclaw_agent_edit = QLineEdit()
+        self.openclaw_agent_edit.setPlaceholderText("example-agent")
+        target_layout.addWidget(self.openclaw_agent_edit, 0, 1)
+
+        target_layout.addWidget(QLabel("Session ID (OPENCLAW_SESSION_ID):"), 1, 0)
+        self.openclaw_session_edit = QLineEdit()
+        self.openclaw_session_edit.setPlaceholderText("session-123...")
+        target_layout.addWidget(self.openclaw_session_edit, 1, 1)
+
+        target_layout.addWidget(QLabel("To target / E.164 (OPENCLAW_TO):"), 2, 0)
+        self.openclaw_to_edit = QLineEdit()
+        self.openclaw_to_edit.setPlaceholderText("+15551234567")
+        target_layout.addWidget(self.openclaw_to_edit, 2, 1)
+
+        openclaw_layout.addWidget(target_group)
+
+        info = QLabel(
+            "If OpenClaw requires explicit target selection, fill one of these values. "
+            "ForumLLM will pass it to the OpenClaw CLI automatically."
+        )
+        info.setWordWrap(True)
+        openclaw_layout.addWidget(info)
+        openclaw_layout.addStretch()
+
+        self.tabs.addTab(openclaw_tab, "OpenClaw")
         
         # === About Tab ===
         about_tab = QWidget()
@@ -277,6 +313,11 @@ class SettingsDialog(QDialog):
         
         # System message
         self.system_edit.setPlainText(llm.system_message)
+
+        # OpenClaw settings
+        self.openclaw_agent_edit.setText(self.config.openclaw.agent_name)
+        self.openclaw_session_edit.setText(self.config.openclaw.session_id)
+        self.openclaw_to_edit.setText(self.config.openclaw.to_target)
         
         # Presets
         self._load_presets()
@@ -334,6 +375,9 @@ class SettingsDialog(QDialog):
                 self.ctx_combo.findText(str(defaults.context_length))
             )
             self.system_edit.setPlainText(defaults.system_message)
+            self.openclaw_agent_edit.clear()
+            self.openclaw_session_edit.clear()
+            self.openclaw_to_edit.clear()
     
     def _save_and_close(self) -> None:
         """Save settings and close dialog."""
@@ -345,6 +389,12 @@ class SettingsDialog(QDialog):
             repeat_penalty=self.repeat_slider.value() / 100,
             context_length=int(self.ctx_combo.currentText()),
             system_message=self.system_edit.toPlainText()
+        )
+
+        self.config.update_openclaw_settings(
+            agent_name=self.openclaw_agent_edit.text().strip(),
+            session_id=self.openclaw_session_edit.text().strip(),
+            to_target=self.openclaw_to_edit.text().strip(),
         )
         
         # Save to file
@@ -361,5 +411,8 @@ class SettingsDialog(QDialog):
             'top_k': self.topk_spin.value(),
             'repeat_penalty': self.repeat_slider.value() / 100,
             'context_length': int(self.ctx_combo.currentText()),
-            'system_message': self.system_edit.toPlainText()
+            'system_message': self.system_edit.toPlainText(),
+            'openclaw_agent_name': self.openclaw_agent_edit.text().strip(),
+            'openclaw_session_id': self.openclaw_session_edit.text().strip(),
+            'openclaw_to_target': self.openclaw_to_edit.text().strip(),
         }

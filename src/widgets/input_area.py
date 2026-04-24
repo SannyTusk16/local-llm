@@ -162,7 +162,7 @@ class InputArea(QWidget):
             self,
             "Attach files",
             "",
-            "Supported files (*.png *.jpg *.jpeg *.webp *.gif *.bmp *.txt *.md *.pdf *.doc *.docx *.json *.csv *.yaml *.yml *.xml *.wav *.mp3 *.ogg *.m4a *.flac);;All files (*.*)"
+            "Supported files (*.png *.jpg *.jpeg *.webp *.gif *.bmp *.mp4 *.mov *.mkv *.webm *.avi *.m4v *.txt *.md *.pdf *.doc *.docx *.json *.csv *.yaml *.yml *.xml *.wav *.mp3 *.ogg *.m4a *.flac);;All files (*.*)"
         )
 
         if files:

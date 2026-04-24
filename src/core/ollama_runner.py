@@ -51,6 +51,7 @@ class OllamaRunner:
     }
     DOC_BINARY_EXTENSIONS = {".pdf", ".doc", ".docx"}
     AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac"}
+    VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
     
     @staticmethod
     def is_ollama_installed() -> bool:
@@ -178,6 +179,7 @@ class OllamaRunner:
         images_b64: List[str] = []
         audios_payload: List[Dict[str, str]] = []
         doc_context_parts: List[str] = []
+        video_context_parts: List[str] = []
 
         for raw_path in attachments:
             file_path = Path(raw_path)
@@ -208,6 +210,13 @@ class OllamaRunner:
                 )
                 continue
 
+            if suffix in self.VIDEO_EXTENSIONS:
+                video_context_parts.append(
+                    f"\n\n--- Video file attached: {file_path.name} ---\n"
+                    f"Path: {file_path.resolve()}"
+                )
+                continue
+
             if suffix in self.DOC_TEXT_EXTENSIONS or suffix in self.DOC_BINARY_EXTENSIONS:
                 extracted = self._extract_document_text(file_path)
                 if extracted.strip():
@@ -226,6 +235,11 @@ class OllamaRunner:
 
         if doc_context_parts:
             user_message["content"] = f"{message}{''.join(doc_context_parts)}"
+
+        if video_context_parts:
+            user_message["content"] = (
+                f"{user_message['content']}{''.join(video_context_parts)}"
+            )
 
         return user_message
     

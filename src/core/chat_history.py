@@ -6,7 +6,7 @@ SQLite-based local storage for conversations.
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
 
 
@@ -27,6 +27,30 @@ class Message:
             role=row[2],
             content=row[3],
             created_at=datetime.fromisoformat(row[4])
+        )
+
+
+@dataclass
+class Attachment:
+    """Represents a persisted attachment linked to a message."""
+    id: Optional[int]
+    message_id: int
+    conversation_id: int
+    file_name: str
+    file_path: str
+    kind: str
+    created_at: datetime
+
+    @classmethod
+    def from_row(cls, row: tuple) -> 'Attachment':
+        return cls(
+            id=row[0],
+            message_id=row[1],
+            conversation_id=row[2],
+            file_name=row[3],
+            file_path=row[4],
+            kind=row[5],
+            created_at=datetime.fromisoformat(row[6])
         )
 
 
@@ -60,7 +84,11 @@ class Conversation:
 class ChatHistory:
     """SQLite-based chat history manager."""
     
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
+
+    IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+    VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
+    AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac"}
     
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or Path.home() / ".forumllm" / "data" / "chat_history.db"
@@ -73,6 +101,7 @@ class ChatHistory:
         if self._conn is None:
             self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+            self._conn.execute('PRAGMA foreign_keys = ON')
         return self._conn
     
     def _init_db(self) -> None:
@@ -103,9 +132,24 @@ class ChatHistory:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                conversation_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+            );
             
             CREATE INDEX IF NOT EXISTS idx_messages_conversation 
                 ON messages(conversation_id);
+
+            CREATE INDEX IF NOT EXISTS idx_attachments_message
+                ON attachments(message_id);
             
             CREATE INDEX IF NOT EXISTS idx_conversations_updated 
                 ON conversations(updated_at DESC);
@@ -117,8 +161,100 @@ class ChatHistory:
         if row is None:
             cursor.execute('INSERT INTO schema_version (version) VALUES (?)', 
                          (self.SCHEMA_VERSION,))
+        elif row[0] < self.SCHEMA_VERSION:
+            self._migrate_schema(row[0])
         
         conn.commit()
+
+    def _migrate_schema(self, current_version: int) -> None:
+        """Apply schema migrations to latest version."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        if current_version < 2:
+            cursor.executescript('''
+                CREATE TABLE IF NOT EXISTS attachments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id INTEGER NOT NULL,
+                    conversation_id INTEGER NOT NULL,
+                    file_name TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_attachments_message
+                    ON attachments(message_id);
+            ''')
+
+            cursor.execute(
+                'UPDATE schema_version SET version = ? WHERE version = ?',
+                (2, current_version)
+            )
+
+        conn.commit()
+
+    def _guess_attachment_kind(self, file_path: str) -> str:
+        """Infer attachment kind from extension."""
+        suffix = Path(file_path).suffix.lower()
+        if suffix in self.IMAGE_EXTENSIONS:
+            return 'image'
+        if suffix in self.VIDEO_EXTENSIONS:
+            return 'video'
+        if suffix in self.AUDIO_EXTENSIONS:
+            return 'audio'
+        return 'document'
+
+    def add_attachments(self, message_id: int, conversation_id: int, file_paths: List[str]) -> None:
+        """Persist attachment metadata for a message."""
+        if not file_paths:
+            return
+
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+
+        rows = []
+        for raw in file_paths:
+            path = Path(raw)
+            rows.append(
+                (
+                    message_id,
+                    conversation_id,
+                    path.name,
+                    str(path),
+                    self._guess_attachment_kind(str(path)),
+                    now,
+                )
+            )
+
+        cursor.executemany('''
+            INSERT INTO attachments (message_id, conversation_id, file_name, file_path, kind, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', rows)
+
+        conn.commit()
+
+    def get_conversation_attachments(self, conversation_id: int) -> Dict[int, List[Attachment]]:
+        """Return attachments grouped by message_id for a conversation."""
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT id, message_id, conversation_id, file_name, file_path, kind, created_at
+            FROM attachments
+            WHERE conversation_id = ?
+            ORDER BY created_at ASC
+        ''', (conversation_id,))
+
+        by_message: Dict[int, List[Attachment]] = {}
+        for row in cursor.fetchall():
+            attachment = Attachment.from_row(tuple(row))
+            by_message.setdefault(attachment.message_id, []).append(attachment)
+
+        return by_message
     
     def create_conversation(
         self,
@@ -236,6 +372,8 @@ class ChatHistory:
         """Delete a conversation and all its messages."""
         conn = self._get_conn()
         cursor = conn.cursor()
+
+        cursor.execute('DELETE FROM attachments WHERE conversation_id = ?', (conversation_id,))
         
         # Messages will be deleted via CASCADE
         cursor.execute('DELETE FROM conversations WHERE id = ?', (conversation_id,))
